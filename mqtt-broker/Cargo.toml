@@ -1,0 +1,12 @@
+[package]
+name = "mqtt-broker"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Minimal hand-rolled MQTT 3.1.1 broker, QoS 0 only, for orbic-fusion"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }

@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["fusion-core", "mqtt-broker", "fusion-daemon"]
+
+[profile.release]
+debug = "limited"
+lto = "fat"
+opt-level = "z"
+strip = "debuginfo"
+
+# optimizations to reduce the binary size of the deployed firmware binary
+[profile.firmware]
+inherits = "release"
+strip = true
+codegen-units = 1
+panic = "abort"
+debug = false

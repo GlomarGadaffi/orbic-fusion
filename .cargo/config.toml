@@ -1,0 +1,14 @@
+[alias]
+# Build fusion-daemon for the real Orbic target. No external C cross-compiler
+# needed for this target — rust-lld + crt-static handles it.
+build-firmware = "build -p fusion-daemon --bin fusion-daemon --target armv7-unknown-linux-musleabihf --profile firmware"
+build-firmware-devel = "build -p fusion-daemon --bin fusion-daemon --target armv7-unknown-linux-musleabihf --profile firmware-devel"
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[profile.firmware-devel]
+inherits = "release"
+opt-level = "s"
+lto = false

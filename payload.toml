@@ -1,0 +1,18 @@
+# orbic-toolkit manifest for orbic-fusion.
+#
+# `name` and the last path segment of `data_dir` are deliberately identical
+# ("orbic-fusion") -- orbic-toolkit's `uninstall` derives the data directory
+# from the service name rather than reading the manifest, so a mismatch here
+# would leave real data behind on uninstall (see README's "Known
+# orbic-toolkit gaps" section).
+#
+# Replace <RSYSLOG_HOST>/<RSYSLOG_PORT> with your actual rsyslog endpoint
+# before deploying.
+name        = "orbic-fusion"
+version     = "0.1.0"
+data_dir    = "/data/orbic-fusion"
+binary_name = "fusion-daemon"
+args        = "0.0.0.0:1883 0.0.0.0:8090 <RSYSLOG_HOST> <RSYSLOG_PORT>"
+log_file    = "/data/orbic-fusion/orbic-fusion.log"
+pidfile     = "/tmp/orbic-fusion.pid"
+ports       = [1883, 8090]

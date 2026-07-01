@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>orbic-fusion</title>
+<style>
+  body { font-family: monospace; background: #111; color: #ddd; margin: 2em; }
+  h1 { color: #6cf; }
+  table { border-collapse: collapse; margin-top: 1em; }
+  td, th { padding: 0.3em 1em; border-bottom: 1px solid #333; text-align: left; }
+  #uptime, #total { color: #9f9; }
+</style>
+</head>
+<body>
+<h1>orbic-fusion</h1>
+<p>uptime: <span id="uptime">-</span>s &middot; total messages: <span id="total">-</span> &middot; sink: <span id="sink">-</span></p>
+<table id="by-source"><thead><tr><th>source</th><th>count</th></tr></thead><tbody></tbody></table>
+<script>
+async function poll() {
+  try {
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    document.getElementById('uptime').textContent = s.uptime_secs;
+    document.getElementById('total').textContent = s.total_messages;
+    document.getElementById('sink').textContent = s.sink;
+    const tbody = document.querySelector('#by-source tbody');
+    tbody.innerHTML = '';
+    for (const [source, count] of Object.entries(s.by_source)) {
+      const row = document.createElement('tr');
+      row.innerHTML = `<td>${source}</td><td>${count}</td>`;
+      tbody.appendChild(row);
+    }
+  } catch (e) {
+    // status endpoint unreachable for a beat -- next poll will retry
+  }
+}
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>

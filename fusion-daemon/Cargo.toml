@@ -1,0 +1,17 @@
+[package]
+name = "fusion-daemon"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "The binary deployed to the Orbic: MQTT broker + envelope pipeline + rsyslog sink + status UI"
+
+[[bin]]
+name = "fusion-daemon"
+path = "src/main.rs"
+
+[dependencies]
+fusion-core = { path = "../fusion-core" }
+mqtt-broker = { path = "../mqtt-broker" }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+serde_json = "1"
