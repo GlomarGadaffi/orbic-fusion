@@ -25,7 +25,9 @@ pub const CONNACK_ACCEPTED: u8 = 0x00;
 
 /// Largest remaining length the broker will buffer for one packet. The
 /// spec allows about 256 MB; this device has about 22 MB free. Worst case
-/// queued for the fusion-daemon sink is 500 x this, so keep it small.
+/// in fusion-daemon: 500 queued rsyslog lines, each a JSON envelope of
+/// about 21 KiB (base64 grows 4/3), about 10.7 MiB; plus 256 raw messages
+/// in the channel, up to about 4 MiB. Keep this small.
 pub const MAX_REMAINING_LEN: usize = 16 * 1024;
 const SUBACK_QOS0_GRANTED: u8 = 0x00;
 
@@ -98,6 +100,11 @@ pub fn try_parse(buf: &[u8]) -> Result<Option<(Packet, usize)>, CodecError> {
     let flags = buf[0] & 0x0F;
 
     let Some((remaining_len, varint_len)) = decode_varint(&buf[1..]) else {
+        // Four bytes with no terminator is not a valid length. Waiting for
+        // more bytes here would buffer without limit.
+        if buf.len() >= 5 {
+            return Err(CodecError::Malformed("remaining length varint too long"));
+        }
         return Ok(None);
     };
     // Refuse before buffering the body. Otherwise one client can make the
@@ -394,5 +401,20 @@ mod limit_tests {
         encode_varint(MAX_REMAINING_LEN, &mut buf);
         // Still incomplete (no body yet), but not rejected.
         assert_eq!(try_parse(&buf), Ok(None));
+    }
+
+    #[test]
+    fn rejects_varint_with_no_terminator() {
+        let buf = [0x30, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert_eq!(
+            try_parse(&buf),
+            Err(CodecError::Malformed("remaining length varint too long"))
+        );
+    }
+
+    #[test]
+    fn waits_on_an_unfinished_varint() {
+        // Three continuation bytes: could still become valid, so ask for more.
+        assert_eq!(try_parse(&[0x30, 0xFF, 0xFF, 0xFF]), Ok(None));
     }
 }

@@ -23,8 +23,8 @@ struct Stats {
 
 type Shared = Arc<Mutex<Stats>>;
 
-/// Distinct source labels kept in by_source. Anything past this is counted
-/// under OTHER_SOURCE, so a client cannot grow the map without bound.
+/// Most keys by_source holds, OTHER_SOURCE included. Past the limit, new
+/// sources count under OTHER_SOURCE, so a client cannot grow the map.
 const MAX_SOURCES: usize = 256;
 const OTHER_SOURCE: &str = "(other)";
 /// Longest source label kept as a key. The first topic segment has no
@@ -34,7 +34,7 @@ const MAX_SOURCE_LEN: usize = 64;
 /// Key under which a message from the given source is counted.
 fn source_key(by_source: &HashMap<String, u64>, source: &str) -> String {
     let key: String = source.chars().take(MAX_SOURCE_LEN).collect();
-    if by_source.contains_key(&key) || by_source.len() < MAX_SOURCES {
+    if by_source.contains_key(&key) || by_source.len() < MAX_SOURCES - 1 {
         key
     } else {
         OTHER_SOURCE.to_string()
@@ -124,14 +124,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_sources_past_the_cap_are_counted_as_other() {
+    fn new_source_under_the_limit_keeps_its_own_key() {
         let mut m = HashMap::new();
-        for i in 0..MAX_SOURCES {
+        for i in 0..MAX_SOURCES - 2 {
+            m.insert(format!("s{i}"), 1);
+        }
+        assert_eq!(source_key(&m, "new-source"), "new-source");
+    }
+
+    #[test]
+    fn new_source_at_the_limit_is_counted_as_other() {
+        let mut m = HashMap::new();
+        for i in 0..MAX_SOURCES - 1 {
             m.insert(format!("s{i}"), 1);
         }
         assert_eq!(source_key(&m, "new-source"), OTHER_SOURCE);
         // A source that is already a key keeps its own count.
         assert_eq!(source_key(&m, "s7"), "s7");
+    }
+
+    #[test]
+    fn map_never_exceeds_the_cap() {
+        let mut m: HashMap<String, u64> = HashMap::new();
+        for i in 0..1000 {
+            let key = source_key(&m, &format!("src{i}"));
+            *m.entry(key).or_insert(0) += 1;
+        }
+        assert!(m.len() <= MAX_SOURCES, "len {} over cap", m.len());
     }
 
     #[test]

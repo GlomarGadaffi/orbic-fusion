@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at, Instant};
 
 use crate::codec::{self, CONNACK_ACCEPTED, Packet};
 
@@ -18,8 +18,14 @@ pub struct PublishedMessage {
 const MAX_CONNECTIONS: usize = 32;
 /// Idle limit before CONNECT. The keep-alive from CONNECT takes over after that.
 const PRE_CONNECT_IDLE: Duration = Duration::from_secs(10);
-/// Idle limit when the client sends keep-alive 0 (the spec says no limit).
+/// Idle limit when the client sends keep-alive 0. This is a deliberate
+/// deviation: MQTT 3.1.1 section 3.1.2.10 sets no inactivity limit for keep-alive 0.
+/// Capped to bound idle sockets on this device. Producers must send a non-zero
+/// keep-alive.
 const MAX_IDLE: Duration = Duration::from_secs(300);
+/// Longest a single write may block. A client that stops reading must not
+/// hold a slot forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Broker {
     listener: TcpListener,
@@ -60,26 +66,33 @@ impl Broker {
     }
 }
 
+/// Idle limit after CONNECT: 1.5x the keep-alive, per MQTT 3.1.1 section 3.1.2.10.
+fn idle_after_connect(keep_alive: u16) -> Duration {
+    if keep_alive > 0 {
+        Duration::from_millis(u64::from(keep_alive) * 1500)
+    } else {
+        MAX_IDLE
+    }
+}
+
 async fn handle_connection(mut stream: TcpStream, tx: mpsc::Sender<PublishedMessage>) {
     let mut buf: Vec<u8> = Vec::new();
     let mut read_buf = [0u8; 4096];
     let mut idle = PRE_CONNECT_IDLE;
+    // The deadline moves only when a complete packet is handled. Partial bytes
+    // do not move it, so a client that trickles bytes cannot hold a slot.
+    let mut deadline = Instant::now() + idle;
 
     loop {
         loop {
             match codec::try_parse(&buf) {
                 Ok(Some((packet, consumed))) => {
-                    // MQTT 3.1.1 section 3.1.2.10: wait 1.5x the keep-alive before
-                    // treating the client as gone.
                     if let Packet::Connect { keep_alive, .. } = &packet {
-                        idle = if *keep_alive > 0 {
-                            Duration::from_secs(u64::from(*keep_alive) * 3 / 2)
-                        } else {
-                            MAX_IDLE
-                        };
+                        idle = idle_after_connect(*keep_alive);
                     }
                     let keep_going = handle_packet(packet, &mut stream, &tx).await;
                     buf.drain(..consumed);
+                    deadline = Instant::now() + idle;
                     if !keep_going {
                         return;
                     }
@@ -89,13 +102,18 @@ async fn handle_connection(mut stream: TcpStream, tx: mpsc::Sender<PublishedMess
             }
         }
 
-        match timeout(idle, stream.read(&mut read_buf)).await {
+        match timeout_at(deadline, stream.read(&mut read_buf)).await {
             Ok(Ok(0)) => return, // peer closed
             Ok(Ok(n)) => buf.extend_from_slice(&read_buf[..n]),
             Ok(Err(_)) => return,
-            Err(_) => return, // idle past the limit
+            Err(_) => return, // no complete packet within the limit
         }
     }
+}
+
+/// Write with a deadline. Returns false if the write failed or timed out.
+async fn write_timed(stream: &mut TcpStream, bytes: &[u8]) -> bool {
+    matches!(timeout(WRITE_TIMEOUT, stream.write_all(bytes)).await, Ok(Ok(())))
 }
 
 /// Returns `false` when the connection should be torn down (DISCONNECT or a
@@ -106,10 +124,9 @@ async fn handle_packet(
     tx: &mpsc::Sender<PublishedMessage>,
 ) -> bool {
     match packet {
-        Packet::Connect { .. } => stream
-            .write_all(&codec::encode_connack(false, CONNACK_ACCEPTED))
-            .await
-            .is_ok(),
+        Packet::Connect { .. } => {
+            write_timed(stream, &codec::encode_connack(false, CONNACK_ACCEPTED)).await
+        }
         Packet::Publish { topic, payload } => {
             // Never block a producer's connection on the fusion-daemon's own
             // downstream backpressure — drop-newest if the internal channel
@@ -118,11 +135,10 @@ async fn handle_packet(
             let _ = tx.try_send(PublishedMessage { topic, payload });
             true
         }
-        Packet::Subscribe { packet_id, filters } => stream
-            .write_all(&codec::encode_suback(packet_id, filters.len()))
-            .await
-            .is_ok(),
-        Packet::PingReq => stream.write_all(&codec::encode_pingresp()).await.is_ok(),
+        Packet::Subscribe { packet_id, filters } => {
+            write_timed(stream, &codec::encode_suback(packet_id, filters.len())).await
+        }
+        Packet::PingReq => write_timed(stream, &codec::encode_pingresp()).await,
         Packet::Disconnect => false,
         // ConnAck/SubAck/PingResp are broker->client only; a client sending
         // one of these is non-conformant. Ignore rather than tear the
@@ -242,5 +258,54 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(msg.topic, "deauth-detector/base-01/alert");
+    }
+
+    #[test]
+    fn idle_after_connect_is_one_and_a_half_keep_alive() {
+        assert_eq!(idle_after_connect(1), Duration::from_millis(1500));
+        assert_eq!(idle_after_connect(60), Duration::from_secs(90));
+        assert_eq!(idle_after_connect(0), MAX_IDLE);
+    }
+
+    #[tokio::test]
+    async fn connections_over_the_cap_are_closed_on_accept() {
+        let (addr, _rx) = spawn_broker().await;
+        // Hold every slot without sending CONNECT. Each holds a permit until
+        // PRE_CONNECT_IDLE.
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            held.push(TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut extra = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), extra.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0, "extra connection should be closed, not served");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn trickled_bytes_do_not_extend_the_pre_connect_deadline() {
+        let (addr, _rx) = spawn_broker().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        // CONNECT header claiming 127 body bytes. One body byte a second never
+        // completes the packet, so the deadline must still close the socket.
+        stream.write_all(&[0x10, 0x7F]).await.unwrap();
+        let started = std::time::Instant::now();
+        let mut buf = [0u8; 1];
+        loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "broker kept a trickling pre-CONNECT client open"
+            );
+            let _ = stream.write_all(&[0x00]).await;
+            match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break, // closed by the broker
+                _ => {} // still open: keep trickling
+            }
+        }
     }
 }
