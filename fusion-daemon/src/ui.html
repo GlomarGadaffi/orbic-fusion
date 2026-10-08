@@ -27,7 +27,13 @@ async function poll() {
     tbody.innerHTML = '';
     for (const [source, count] of Object.entries(s.by_source)) {
       const row = document.createElement('tr');
-      row.innerHTML = `<td>${source}</td><td>${count}</td>`;
+      // source comes from an MQTT topic segment, which any client can set.
+      // Use textContent, never innerHTML, so it is shown as text.
+      const sourceCell = document.createElement('td');
+      sourceCell.textContent = source;
+      const countCell = document.createElement('td');
+      countCell.textContent = count;
+      row.append(sourceCell, countCell);
       tbody.appendChild(row);
     }
   } catch (e) {
