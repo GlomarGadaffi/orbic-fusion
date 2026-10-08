@@ -22,6 +22,11 @@ pub enum CodecError {
 }
 
 pub const CONNACK_ACCEPTED: u8 = 0x00;
+
+/// Largest remaining length the broker will buffer for one packet. The
+/// spec allows about 256 MB; this device has about 22 MB free. Worst case
+/// queued for the fusion-daemon sink is 500 x this, so keep it small.
+pub const MAX_REMAINING_LEN: usize = 16 * 1024;
 const SUBACK_QOS0_GRANTED: u8 = 0x00;
 
 // ---- variable-length "remaining length" encoding (MQTT 2.2.3) ----
@@ -95,6 +100,11 @@ pub fn try_parse(buf: &[u8]) -> Result<Option<(Packet, usize)>, CodecError> {
     let Some((remaining_len, varint_len)) = decode_varint(&buf[1..]) else {
         return Ok(None);
     };
+    // Refuse before buffering the body. Otherwise one client can make the
+    // broker hold up to about 256 MB by sending a large header and then slow data.
+    if remaining_len > MAX_REMAINING_LEN {
+        return Err(CodecError::Malformed("remaining length over limit"));
+    }
     let header_len = 1 + varint_len;
     let total_len = header_len + remaining_len;
     if buf.len() < total_len {
@@ -360,5 +370,29 @@ mod tests {
         let (second, consumed2) = try_parse(&buf[consumed1..]).unwrap().unwrap();
         assert_eq!(second, Packet::PingReq);
         assert_eq!(consumed1 + consumed2, buf.len());
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_remaining_length_over_limit_before_buffering() {
+        // Header claims one byte over the limit. No body bytes are sent.
+        let mut buf = vec![0x30];
+        encode_varint(MAX_REMAINING_LEN + 1, &mut buf);
+        assert_eq!(
+            try_parse(&buf),
+            Err(CodecError::Malformed("remaining length over limit"))
+        );
+    }
+
+    #[test]
+    fn accepts_remaining_length_at_limit() {
+        let mut buf = vec![0x30];
+        encode_varint(MAX_REMAINING_LEN, &mut buf);
+        // Still incomplete (no body yet), but not rejected.
+        assert_eq!(try_parse(&buf), Ok(None));
     }
 }

@@ -23,6 +23,24 @@ struct Stats {
 
 type Shared = Arc<Mutex<Stats>>;
 
+/// Distinct source labels kept in by_source. Anything past this is counted
+/// under OTHER_SOURCE, so a client cannot grow the map without bound.
+const MAX_SOURCES: usize = 256;
+const OTHER_SOURCE: &str = "(other)";
+/// Longest source label kept as a key. The first topic segment has no
+/// length limit of its own.
+const MAX_SOURCE_LEN: usize = 64;
+
+/// Key under which a message from the given source is counted.
+fn source_key(by_source: &HashMap<String, u64>, source: &str) -> String {
+    let key: String = source.chars().take(MAX_SOURCE_LEN).collect();
+    if by_source.contains_key(&key) || by_source.len() < MAX_SOURCES {
+        key
+    } else {
+        OTHER_SOURCE.to_string()
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -62,7 +80,8 @@ async fn main() {
             {
                 let mut s = ingest_stats.lock().unwrap();
                 s.total_messages += 1;
-                *s.by_source.entry(envelope.source.clone()).or_insert(0) += 1;
+                let key = source_key(&s.by_source, &envelope.source);
+                *s.by_source.entry(key).or_insert(0) += 1;
             }
             // Best-effort: RsyslogSink enqueues onto its own bounded retry
             // buffer and never blocks here, so a send "failure" (there
@@ -98,4 +117,27 @@ async fn status_handler(State(stats): State<Shared>) -> Json<serde_json::Value> 
         "by_source": s.by_source,
         "sink": "rsyslog",
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_sources_past_the_cap_are_counted_as_other() {
+        let mut m = HashMap::new();
+        for i in 0..MAX_SOURCES {
+            m.insert(format!("s{i}"), 1);
+        }
+        assert_eq!(source_key(&m, "new-source"), OTHER_SOURCE);
+        // A source that is already a key keeps its own count.
+        assert_eq!(source_key(&m, "s7"), "s7");
+    }
+
+    #[test]
+    fn long_source_labels_are_truncated() {
+        let m = HashMap::new();
+        let long = "x".repeat(500);
+        assert_eq!(source_key(&m, &long).len(), MAX_SOURCE_LEN);
+    }
 }

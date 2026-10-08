@@ -1,6 +1,10 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::time::timeout;
 
 use crate::codec::{self, CONNACK_ACCEPTED, Packet};
 
@@ -9,6 +13,13 @@ pub struct PublishedMessage {
     pub topic: String,
     pub payload: Vec<u8>,
 }
+
+/// Concurrent client connections. Extra connections are closed on accept.
+const MAX_CONNECTIONS: usize = 32;
+/// Idle limit before CONNECT. The keep-alive from CONNECT takes over after that.
+const PRE_CONNECT_IDLE: Duration = Duration::from_secs(10);
+/// Idle limit when the client sends keep-alive 0 (the spec says no limit).
+const MAX_IDLE: Duration = Duration::from_secs(300);
 
 pub struct Broker {
     listener: TcpListener,
@@ -29,12 +40,20 @@ impl Broker {
     /// (bad TCP peer, malformed stream) only tears down its own connection
     /// task, never the accept loop itself.
     pub async fn run(self) {
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         loop {
             match self.listener.accept().await {
-                Ok((stream, _peer)) => {
-                    let tx = self.tx.clone();
-                    tokio::spawn(handle_connection(stream, tx));
-                }
+                Ok((stream, _peer)) => match slots.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        let tx = self.tx.clone();
+                        tokio::spawn(async move {
+                            handle_connection(stream, tx).await;
+                            drop(permit);
+                        });
+                    }
+                    // Over the cap: close now rather than queue the socket.
+                    Err(_) => drop(stream),
+                },
                 Err(_) => continue,
             }
         }
@@ -44,11 +63,21 @@ impl Broker {
 async fn handle_connection(mut stream: TcpStream, tx: mpsc::Sender<PublishedMessage>) {
     let mut buf: Vec<u8> = Vec::new();
     let mut read_buf = [0u8; 4096];
+    let mut idle = PRE_CONNECT_IDLE;
 
     loop {
         loop {
             match codec::try_parse(&buf) {
                 Ok(Some((packet, consumed))) => {
+                    // MQTT 3.1.1 section 3.1.2.10: wait 1.5x the keep-alive before
+                    // treating the client as gone.
+                    if let Packet::Connect { keep_alive, .. } = &packet {
+                        idle = if *keep_alive > 0 {
+                            Duration::from_secs(u64::from(*keep_alive) * 3 / 2)
+                        } else {
+                            MAX_IDLE
+                        };
+                    }
                     let keep_going = handle_packet(packet, &mut stream, &tx).await;
                     buf.drain(..consumed);
                     if !keep_going {
@@ -60,10 +89,11 @@ async fn handle_connection(mut stream: TcpStream, tx: mpsc::Sender<PublishedMess
             }
         }
 
-        match stream.read(&mut read_buf).await {
-            Ok(0) => return, // peer closed
-            Ok(n) => buf.extend_from_slice(&read_buf[..n]),
-            Err(_) => return,
+        match timeout(idle, stream.read(&mut read_buf)).await {
+            Ok(Ok(0)) => return, // peer closed
+            Ok(Ok(n)) => buf.extend_from_slice(&read_buf[..n]),
+            Ok(Err(_)) => return,
+            Err(_) => return, // idle past the limit
         }
     }
 }
